@@ -8,6 +8,7 @@ from torch._inductor.codegen.common import ArgName, ConstexprArg, SizeArg
 from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton_combo_kernel import ComboKernel
+import torch._inductor.codegen.triton_combo_kernel as combo_module
 from torch._inductor.codegen.triton_utils import signature_to_meta, config_of
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.runtime.runtime_utils import next_power_of_2
@@ -220,10 +221,6 @@ class NPUComboKernel(ComboKernel):
             argdefs.append(ArgName(block_arg.name))
 
         for axis in kernel.tiling_axis:
-            if axis.name[0] == 'r' and kernel.persistent_reduction:
-                continue
-            if axis.is_no_loop_axis:
-                continue
             add_constexpr_arg(f"{axis.name.upper()}BLOCK_SUB")
 
     def codegen_blocks(self, code: IndentedBuffer) -> None:
@@ -347,3 +344,86 @@ class NPUComboKernel(ComboKernel):
                         meta[numel_name] = int(V.graph.sizevars.simplify(tree.numel))
 
         return meta
+
+def patch_combo_kernel_horizontal_partition():
+    def npu_default_custom_combo_kernel_horizontal_partition(
+        nodes,
+        triton_scheduling,
+        kernel_map,
+        node_info_map
+    ):
+        """Horizontally partition the given list of nodes into a list of list of nodes where each sublist
+        represents a partition. Nodes in different partitions are implemented in different combo kernels.
+        Nodes in the same partition are likely to be implemented
+        in the same combo kernel, but subject to subsequent restrictions like CUDA limits for number of args.
+
+        Input arguments:
+            nodes: a list of fused scheduler nodes to partition.
+            triton_scheduling: TritonScheduling instance.
+            kernel_map: a map from node to its kernel.
+            node_info_map: a map from node to (node_schedule, tiled_groups, numel, rnumel).
+        Output:
+            a list of list of nodes with each sublist representing a partition.
+
+        The default algorithm is to partition nodes based on the following rules:
+            1) nodes with the same number of block dimensions are grouped together.
+            2) large pointwise nodes (numels greater than LARGE_NUMELS) are separated from other nodes.
+            3) large reduce nodes are separated from other nodes.
+        """
+
+        assert len(nodes) >= 1
+
+        # first partition nodes based on number of block dimensions
+        tilings = [node_info_map[n][1] for n in nodes]
+
+        max_dims = max(len(t) for t in tilings)
+        nodes_per_ndim = []
+        for i in range(2, max_dims + 1):
+            group_per_dim = [n for n, t in zip(nodes, tilings) if len(t) == i]
+            reduction = [
+                n
+                for n in group_per_dim
+                if kernel_map[n].inside_reduction
+                and not (kernel_map[n].persistent_reduction and kernel_map[n].no_x_dim)
+            ]
+            not_reduction = [n for n in group_per_dim if n not in reduction]
+            # rnumel > 2048 usually has long execution time
+            # BaseSchedulerNode.group[-1][-1] is rnumel for reduction nodes
+            long_reduction = [
+                n
+                for n in reduction
+                if (
+                    V.graph.sizevars.shape_env.has_hint(sympy.prod(n.group[-1][-1]))
+                    and V.graph.sizevars.size_hint(sympy.prod(n.group[-1][-1])) > 2048  # type: ignore[arg-type]
+                )
+            ]
+            short_reduction = [n for n in reduction if n not in long_reduction]
+            if long_reduction:
+                combo_module.log.debug(
+                    "ComboKernels: %d long reduction nodes are separated",
+                    len(long_reduction),
+                )
+            large_pointwise = [
+                n
+                for n in not_reduction
+                if not kernel_map[n].inside_reduction
+                and len(kernel_map[n].numels) == 2
+                and V.graph.sizevars.shape_env.has_hint(kernel_map[n].numels["x"])
+                and V.graph.sizevars.size_hint(kernel_map[n].numels["x"]) > combo_module.LARGE_NUMELS
+            ]
+            if large_pointwise:
+                combo_module.log.debug(
+                    "ComboKernels: %d large pointwise nodes are separated",
+                    len(large_pointwise),
+                )
+                not_reduction = [n for n in not_reduction if n not in large_pointwise]
+                nodes_per_ndim.extend([node] for node in large_pointwise)
+
+            nodes_per_ndim.extend(
+                g for g in (not_reduction, short_reduction, long_reduction) if g
+            )
+
+        assert sum(len(p) for p in nodes_per_ndim) == len(nodes)
+        return nodes_per_ndim
+    combo_module._default_custom_combo_kernel_horizontal_partition = npu_default_custom_combo_kernel_horizontal_partition
+    combo_module.set_custom_combo_kernel_horizontal_partition(npu_default_custom_combo_kernel_horizontal_partition)
