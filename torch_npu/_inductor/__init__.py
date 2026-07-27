@@ -15,6 +15,7 @@ from .graph import patch_codegen_with_cpp_wrapper
 from .utils import patch_has_triton, patch_device_supports_tma, patch_is_gpu, get_current_raw_stream
 # All backends need npu/cpu/mps device_op_overrides.
 from .codegen.common import register_device_op_overrides_npu, patch_cache_base_get_system
+from .codegen.triton_combo_kernel import patch_combo_kernel_horizontal_partition
 from .shape_handling import NPUShapeHandling, patch_shape_handling
 from ._npu_meta_registration import npu_patch_meta
 # 顶层 patch：所有 inductor backend（triton / mlir / dvm / ascendc）都需要的 NPU 设备级patch，
@@ -22,6 +23,7 @@ from ._npu_meta_registration import npu_patch_meta
 npu_patch_meta()
 _dynamo_register_interface_for_device()
 register_device_op_overrides_npu()
+patch_combo_kernel_horizontal_partition()
 
 
 def _apply_common_patches():

@@ -8,12 +8,14 @@ from torch._inductor.codegen.common import ArgName, ConstexprArg, SizeArg
 from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton_combo_kernel import ComboKernel
+import torch._inductor.codegen.triton_combo_kernel as combo_module
 from torch._inductor.codegen.triton_utils import signature_to_meta, config_of
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.runtime.triton_heuristics import SequentialComboKernelGrid
 from torch._inductor.utils import IndentedBuffer, Placeholder, triton_version_uses_attrs_dict
 from torch._inductor.virtualized import V
+from unittest.mock import patch
 
 from ..codegen.triton import NPUIndexTritonKernel
 
@@ -220,10 +222,6 @@ class NPUComboKernel(ComboKernel):
             argdefs.append(ArgName(block_arg.name))
 
         for axis in kernel.tiling_axis:
-            if axis.name[0] == 'r' and kernel.persistent_reduction:
-                continue
-            if axis.is_no_loop_axis:
-                continue
             add_constexpr_arg(f"{axis.name.upper()}BLOCK_SUB")
 
     def codegen_blocks(self, code: IndentedBuffer) -> None:
@@ -347,3 +345,29 @@ class NPUComboKernel(ComboKernel):
                         meta[numel_name] = int(V.graph.sizevars.simplify(tree.numel))
 
         return meta
+
+
+original_horizontal_partition = combo_module._default_custom_combo_kernel_horizontal_partition
+
+def npu_wrapper_combo_kernel_horizontal_partition(*args, **kwargs):
+    orig_has_hint = V.graph.sizevars.shape_env.has_hint
+    orig_size_hint = V.graph.sizevars.size_hint
+
+    def custom_has_hint(val, **kw):
+        if isinstance(val, (list, tuple)):
+            val = sympy.prod(val)
+        return orig_has_hint(val, **kw)
+
+    def custom_size_hint(val, **kw):
+        if isinstance(val, (list, tuple)):
+            val = sympy.prod(val)
+        return orig_size_hint(val, **kw)
+
+    with patch.object(V.graph.sizevars.shape_env, 'has_hint', side_effect=custom_has_hint), \
+        patch.object(V.graph.sizevars, 'size_hint', side_effect=custom_size_hint):
+
+        return original_horizontal_partition(*args, **kwargs)
+
+def patch_combo_kernel_horizontal_partition():
+    combo_module._default_custom_combo_kernel_horizontal_partition = npu_wrapper_combo_kernel_horizontal_partition
+    combo_module.set_custom_combo_kernel_horizontal_partition(npu_wrapper_combo_kernel_horizontal_partition)
