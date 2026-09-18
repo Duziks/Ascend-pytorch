@@ -268,6 +268,45 @@ def _device_wrapper(enter_fn, white_list):
             setattr(enter_fn, fn_name, _wrapper_cuda(fn))
 
 
+def _register_wrapped_torch_dynamo_handler(
+    original_fn,
+    wrapped_fn,
+    original_handler,
+):
+    if original_handler is None:
+        return
+
+    from torch._dynamo.variables.base import VariableTracker
+    from torch._dynamo.variables.torch import TorchInGraphFunctionVariable
+
+    def wrapped_handler(self, tx, *args, **kwargs):
+        # Dynamo handlers bypass the Python wrapper, so preserve its explicit
+        # CUDA-to-NPU device conversion here.
+        kwargs = dict(kwargs)
+        device_var = kwargs.get("device")
+
+        if device_var is not None and device_var.is_python_constant():
+            device = device_var.as_python_constant()
+
+            if isinstance(device, str) and "cuda" in device:
+                kwargs["device"] = VariableTracker.build(
+                    tx,
+                    device.replace("cuda", "npu"),
+                )
+            elif isinstance(device, torch.device) and device.type == "cuda":
+                device_str = (
+                    f"npu:{device.index}" if device.index is not None else "npu"
+                )
+                kwargs["device"] = VariableTracker.build(
+                    tx,
+                    torch.device(device_str),
+                )
+
+        return original_handler(self, tx, *args, **kwargs)
+
+    TorchInGraphFunctionVariable._get_handlers()[wrapped_fn] = wrapped_handler
+
+
 def _wrapper_hccl(fn):
     @wraps(fn)
     def decorated(*args, **kwargs):
@@ -343,7 +382,7 @@ def _patch_jit_script():
 
 
 def _patch_has_triton():
-    return False
+    return _dynamo.has_triton()
 
 
 def _get_npu_type():
@@ -523,7 +562,20 @@ def _init():
     torch.profiler.profile = _wrapper_profiler(torch.profiler.profile)
 
     # torch.*
+    from torch._dynamo.variables.torch import TorchInGraphFunctionVariable
+
+    original_torch_tensor = torch.tensor
+    dynamo_handlers = TorchInGraphFunctionVariable._get_handlers()
+    tensor_handler = dynamo_handlers.get(original_torch_tensor)
+
     _device_wrapper(torch, torch_fn_white_list)
+    _register_wrapped_torch_dynamo_handler(
+        original_torch_tensor,
+        torch.tensor,
+        tensor_handler,
+    )
+    torch._dynamo.trace_rules.clear_lru_cache()
+
     torch.UntypedStorage.__new__ = _wrapper_cuda(torch.UntypedStorage.__new__)
     torch.storage.TypedStorage.is_cuda = torch.storage.TypedStorage.is_npu
     torch.Generator = _GeneratorProxy

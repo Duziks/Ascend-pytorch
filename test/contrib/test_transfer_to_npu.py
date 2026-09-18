@@ -590,5 +590,96 @@ class TestTransferToNpu(TestCase):
         self.assertEqual(torch.get_autocast_gpu_dtype(), torch.bfloat16)
         torch.set_autocast_gpu_dtype(torch.float16)
 
+    def test_patch_has_triton_uses_npu_detection(self):
+        with patch.object(
+            transfer_to_npu._dynamo,
+            "has_triton",
+            return_value=True,
+        ) as mock_has_triton:
+            self.assertTrue(transfer_to_npu._patch_has_triton())
+            mock_has_triton.assert_called_once_with()
+
+        with patch.object(
+            transfer_to_npu._dynamo,
+            "has_triton",
+            return_value=False,
+        ) as mock_has_triton:
+            self.assertFalse(transfer_to_npu._patch_has_triton())
+            mock_has_triton.assert_called_once_with()
+
+    def test_wrapped_tensor_has_dynamo_handler(self):
+        from torch._dynamo.variables.torch import TorchInGraphFunctionVariable
+
+        handlers = TorchInGraphFunctionVariable._get_handlers()
+
+        self.assertTrue(hasattr(torch.tensor, "__wrapped__"))
+        original_torch_tensor = torch.tensor.__wrapped__
+
+        self.assertIn(original_torch_tensor, handlers)
+        self.assertIn(torch.tensor, handlers)
+        self.assertIsNot(
+            handlers[torch.tensor],
+            handlers[original_torch_tensor],
+        )
+
+    @torch._dynamo.config.patch(capture_scalar_outputs=True)
+    def test_compile_tensor_with_unbacked_symint(self):
+        if not transfer_to_npu._patch_has_triton():
+            self.skipTest("requires triton-ascend")
+
+        import torch_npu._inductor  # noqa: F401
+        from torch._inductor.codegen.common import device_codegens
+
+        self.assertIn("npu", device_codegens)
+
+        def fn(x):
+            values = x.tolist()
+            return torch.tensor(sum(values))
+
+        x = torch.randint(10, (100,), device="npu")
+        expected = fn(x)
+
+        torch._dynamo.reset()
+        try:
+            compiled_fn = torch.compile(
+                fn,
+                backend="inductor",
+                fullgraph=True,
+            )
+            actual = compiled_fn(x)
+        finally:
+            torch._dynamo.reset()
+
+        self.assertEqual(expected, actual)
+
+    @torch._dynamo.config.patch(capture_scalar_outputs=True)
+    def test_compile_tensor_cuda_device_is_mapped_to_npu(self):
+        if not transfer_to_npu._patch_has_triton():
+            self.skipTest("requires triton-ascend")
+
+        import torch_npu._inductor  # noqa: F401
+
+        def fn(x):
+            value = x.tolist()[0]
+            return torch.tensor(value, device="cuda")
+
+        x = torch.randint(10, (1,), device="npu")
+        expected = fn(x)
+
+        torch._dynamo.reset()
+        try:
+            compiled_fn = torch.compile(
+                fn,
+                backend="inductor",
+                fullgraph=True,
+            )
+            actual = compiled_fn(x)
+        finally:
+            torch._dynamo.reset()
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual.device.type, "npu")
+
+
 if __name__ == "__main__":
     run_tests()
