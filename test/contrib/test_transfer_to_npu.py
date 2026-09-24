@@ -13,6 +13,39 @@ from torch_npu.contrib import transfer_to_npu
 
 class TestTransferToNpu(TestCase):
 
+    def test_get_gpu_type_cache_contract(self):
+        from torch._inductor.utils import get_gpu_type
+
+        self.assertIs(get_gpu_type, transfer_to_npu._get_npu_type)
+        get_gpu_type.cache_clear()
+        try:
+            self.assertEqual(get_gpu_type(), "npu")
+            self.assertEqual(get_gpu_type(), "npu")
+            self.assertEqual(get_gpu_type.cache_info().misses, 1)
+            self.assertEqual(get_gpu_type.cache_info().hits, 1)
+        finally:
+            get_gpu_type.cache_clear()
+        self.assertEqual(get_gpu_type.cache_info().currsize, 0)
+
+    def test_inductor_import_after_transfer(self):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-c", "\n".join([
+                "import torch, torch_npu",
+                "from torch_npu.contrib import transfer_to_npu",
+                "import torch_npu._inductor",
+                "from torch._inductor.utils import get_gpu_type",
+                "get_gpu_type.cache_clear()",
+                "assert get_gpu_type() == 'npu'",
+            ])],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_generator(self):
         g0 = torch.Generator()
         self.assertTrue(isinstance(g0, torch.Generator))

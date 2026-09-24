@@ -347,6 +347,8 @@ def _patch_has_triton(**kwargs):
     return False
 
 
+# Preserve the cached get_gpu_type interface used by Inductor registration.
+@functools.cache
 def _get_npu_type():
     return "npu"
 
